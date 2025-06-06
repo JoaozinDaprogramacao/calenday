@@ -1,18 +1,11 @@
 const CACHE_NAME = 'agenda-pessoal-cache-v1';
-const urlsToCache = [
+
+// URLs locais para cache direto
+const localUrlsToCache = [
   '/',
   '/index.html',
-  '/index.tsx', // Or the bundled JS file if you know its name, e.g., /assets/index.js
-  // Styles - Tailwind is via CDN, fonts also. Service worker can cache these too.
-  'https://cdn.tailwindcss.com',
-  'https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap',
-  // JS modules from esm.sh (Note: Caching versioned URLs can be tricky with updates)
-  'https://esm.sh/react@^19.1.0',
-  'https://esm.sh/react-dom@^19.1.0/client',
-  'https://esm.sh/react-router-dom@^7.6.2',
-  // You might need to list more specific esm.sh URLs if the above are not sufficient
-  // Or implement a more dynamic caching strategy for these.
-  // Add paths to your icons if you serve them locally, e.g., '/icons/icon-192x192.png'
+  '/index.tsx', // Ou o arquivo JS empacotado, se aplicável
+  // Ícones locais
   '/icons/icon-72x72.png',
   '/icons/icon-96x96.png',
   '/icons/icon-128x128.png',
@@ -21,8 +14,17 @@ const urlsToCache = [
   '/icons/icon-192x192.png',
   '/icons/icon-384x384.png',
   '/icons/icon-512x512.png',
-  // Add other static assets if any (e.g., images, sound files if local)
-   "https://cdn.freesound.org/previews/505/505726_10063505-lq.mp3" 
+];
+
+// URLs de CDN ou externas (podem precisar de tratamento no-cors se não tiverem CORS adequado)
+const externalUrlsToCache = [
+  'https://cdn.tailwindcss.com',
+  'https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap',
+  'https://esm.sh/react@^19.1.0',
+  'https://esm.sh/react-dom@^19.1.0/client', // Ajustado para /client para corresponder ao importmap típico
+  'https://esm.sh/react-router-dom@^7.6.2',
+  // Adicionar URLs mais específicas do esm.sh se necessário, inspecionando a aba Network
+  "https://cdn.freesound.org/previews/505/505726_10063505-lq.mp3"
 ];
 
 self.addEventListener('install', event => {
@@ -31,27 +33,47 @@ self.addEventListener('install', event => {
     caches.open(CACHE_NAME)
       .then(cache => {
         console.log('Service Worker: Caching app shell');
-        // Use addAll with caution for external URLs, if one fails, all fail.
-        // Consider caching external resources on first fetch instead.
-        const cachePromises = urlsToCache.map(urlToCache => {
-          return fetch(new Request(urlToCache, { mode: 'no-cors' })) // Use no-cors for opaque responses from CDNs
+        
+        const localCachePromises = localUrlsToCache.map(url => {
+          return fetch(url)
             .then(response => {
-                if (response.status === 0 || response.ok || response.type === 'opaque') { // Check for opaque responses as well
-                   return cache.put(urlToCache, response);
-                }
-                console.warn(`Service Worker: Failed to fetch and cache ${urlToCache}`, response.status, response.statusText);
-                return Promise.resolve(); // Don't let one failure stop all caching
+              if (!response.ok) {
+                console.warn(`Service Worker: Failed to fetch local resource ${url}. Status: ${response.status}`);
+                // Não armazena respostas de erro no cache para recursos locais críticos
+                return Promise.resolve(); // Continua mesmo se um falhar
+              }
+              return cache.put(url, response);
             })
             .catch(err => {
-                console.warn(`Service Worker: Error fetching and caching ${urlToCache}`, err);
-                return Promise.resolve();
+              console.warn(`Service Worker: Error fetching local resource ${url}`, err);
+              return Promise.resolve();
             });
         });
-        return Promise.all(cachePromises);
+
+        const externalCachePromises = externalUrlsToCache.map(url => {
+          // Para recursos externos, 'no-cors' pode ser necessário se eles não tiverem cabeçalhos CORS adequados.
+          // Isso resulta em uma "resposta opaca", que não podemos inspecionar, mas pode ser armazenada.
+          return fetch(new Request(url, { mode: 'no-cors' }))
+            .then(response => {
+              // Para respostas opacas (type 'opaque'), o status é 0.
+              // Verifique 'ok' para respostas não opacas.
+              if (response.ok || response.type === 'opaque') {
+                return cache.put(url, response);
+              }
+              console.warn(`Service Worker: Failed to fetch external resource ${url}`);
+              return Promise.resolve();
+            })
+            .catch(err => {
+              console.warn(`Service Worker: Error fetching external resource ${url}`, err);
+              return Promise.resolve();
+            });
+        });
+        
+        return Promise.all([...localCachePromises, ...externalCachePromises]);
       })
       .then(() => {
-        console.log('Service Worker: All resources have been fetched and cached (or skipped on error).');
-        return self.skipWaiting(); // Activate worker immediately
+        console.log('Service Worker: All specified resources have been attempted to be cached.');
+        return self.skipWaiting(); // Ativa o service worker imediatamente
       })
       .catch(error => {
         console.error('Service Worker: Caching failed during install', error);
@@ -71,42 +93,38 @@ self.addEventListener('activate', event => {
           }
         })
       );
-    }).then(() => self.clients.claim()) // Claim clients immediately
+    }).then(() => self.clients.claim()) // Reivindica clientes imediatamente
   );
 });
 
 self.addEventListener('fetch', event => {
-  // Let the browser handle requests for scripts from esm.sh directly
-  // if (event.request.url.startsWith('https://esm.sh/')) {
-  //    event.respondWith(fetch(event.request));
-  //    return;
-  // }
-
   event.respondWith(
     caches.match(event.request)
-      .then(response => {
-        if (response) {
+      .then(cachedResponse => {
+        if (cachedResponse) {
           // console.log('Service Worker: Serving from cache:', event.request.url);
-          return response;
+          return cachedResponse;
         }
+
         // console.log('Service Worker: Fetching from network:', event.request.url);
         return fetch(event.request).then(
           networkResponse => {
-            // If it's a successful response and not from a chrome-extension, cache it.
-            // Be careful with caching POST requests or other non-idempotent methods.
             if (networkResponse && networkResponse.status === 200 && event.request.method === 'GET' && !event.request.url.startsWith('chrome-extension://')) {
-               const responseToCache = networkResponse.clone();
-               caches.open(CACHE_NAME)
-                 .then(cache => {
-                   cache.put(event.request, responseToCache);
-                 });
+              const responseToCache = networkResponse.clone();
+              caches.open(CACHE_NAME)
+                .then(cache => {
+                  cache.put(event.request, responseToCache);
+                });
             }
             return networkResponse;
           }
         ).catch(error => {
-          console.error('Service Worker: Fetch failed; returning offline page or error.', error);
-          // Optionally, return a fallback offline page:
-          // return caches.match('/offline.html'); 
+          console.warn('Service Worker: Fetch failed; serving fallback or error for:', event.request.url, error);
+          // Você pode querer retornar uma página offline aqui se o request for de navegação
+          // if (event.request.mode === 'navigate') {
+          //   return caches.match('/offline.html'); // Precisa criar e cachear offline.html
+          // }
+          // Para outros requests, apenas deixe o erro do navegador acontecer.
         });
       })
   );
